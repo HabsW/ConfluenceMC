@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HabsW <d@v1d.eu>
+Date: Fri, 14 Aug 2026 13:06:03 +0200
+Subject: [PATCH] Skip empty random-tick sections
+
+Moonrise already skips the inner random-tick loop when a section has
+no ticking blocks, but the outer loop still visits every section.
+Keep a per-chunk bitset of sections with tickingBlockCount > 0, updated
+from LevelChunkSection on 0/non-zero transitions (including recalc).
+Sparse chunks iterate set bits in sectionIndex order; dense chunks keep
+the linear scan. Empty sections never consumed random-tick RNG.
+
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index 59598bfb95c2f8a38efd92685c46a954dc76739d..69279f4cefa8d09484410209fb71eee0abe49deb 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -972,44 +972,85 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+         final ChunkPos cpos = chunk.getPos();
+         final int offsetX = cpos.x() << 4;
+         final int offsetZ = cpos.z() << 4;
++        final int sectionsLen = sections.length;
+ 
+-        for (int sectionIndex = 0, sectionsLen = sections.length; sectionIndex < sectionsLen; sectionIndex++) {
+-            final int offsetY = (sectionIndex + minSection) << 4;
+-            final LevelChunkSection section = sections[sectionIndex];
+-            final net.minecraft.world.level.chunk.PalettedContainer<net.minecraft.world.level.block.state.BlockState> states = section.getStates();
+-            if (!section.isRandomlyTickingBlocks()) {
+-                continue;
++        // Paper start - skip empty random-tick sections
++        // Empty sections never consume random-tick RNG (the inner loop is behind tickingBlockCount > 0).
++        // Walk only those sections when sparse; dense chunks keep the original linear scan.
++        if (chunk.randomTickSectionMask() == null) {
++            chunk.bindRandomTickSections();
++        }
++        final int eligible = chunk.randomTickEligibleCount();
++        if (eligible <= 0) {
++            return;
++        }
++        if (eligible * 2 >= sectionsLen) {
++            for (int sectionIndex = 0; sectionIndex < sectionsLen; sectionIndex++) {
++                this.randomTickSection(sections[sectionIndex], sectionIndex, minSection, offsetX, offsetZ, tickSpeed, simpleRandom, doubleTickFluids);
++            }
++        } else {
++            final long[] mask = chunk.randomTickSectionMask();
++            int from = 0;
++            while (from < sectionsLen) {
++                final int word = from >>> 6;
++                final long bits = mask[word] >>> (from & 63);
++                if (bits != 0L) {
++                    final int sectionIndex = from + Long.numberOfTrailingZeros(bits);
++                    if (sectionIndex >= sectionsLen) {
++                        break;
++                    }
++                    this.randomTickSection(sections[sectionIndex], sectionIndex, minSection, offsetX, offsetZ, tickSpeed, simpleRandom, doubleTickFluids);
++                    from = sectionIndex + 1;
++                    continue;
++                }
++                from = (word + 1) << 6;
+             }
++        }
++        // Paper end - skip empty random-tick sections
++    }
+ 
+-            final ca.spottedleaf.moonrise.common.list.ShortList tickList = ((ca.spottedleaf.moonrise.patches.block_counting.BlockCountingChunkSection)section).moonrise$getTickingBlockList();
++    // Paper start - skip empty random-tick sections
++    private void randomTickSection(
++            final LevelChunkSection section,
++            final int sectionIndex,
++            final int minSection,
++            final int offsetX,
++            final int offsetZ,
++            final int tickSpeed,
++            final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom simpleRandom,
++            final boolean doubleTickFluids) {
++        if (!section.isRandomlyTickingBlocks()) {
++            return;
++        }
++        final int offsetY = (sectionIndex + minSection) << 4;
++        final net.minecraft.world.level.chunk.PalettedContainer<net.minecraft.world.level.block.state.BlockState> states = section.getStates();
++        final ca.spottedleaf.moonrise.common.list.ShortList tickList = ((ca.spottedleaf.moonrise.patches.block_counting.BlockCountingChunkSection)section).moonrise$getTickingBlockList();
+ 
+-            for (int i = 0; i < tickSpeed; ++i) {
+-                final int tickingBlocks = tickList.size();
+-                final int index = simpleRandom.nextInt() & ((16 * 16 * 16) - 1);
++        for (int i = 0; i < tickSpeed; ++i) {
++            final int tickingBlocks = tickList.size();
++            final int index = simpleRandom.nextInt() & ((16 * 16 * 16) - 1);
+ 
+-                if (index >= tickingBlocks) {
+-                    // most of the time we fall here
+-                    continue;
+-                }
++            if (index >= tickingBlocks) {
++                // most of the time we fall here
++                continue;
++            }
+ 
+-                final int location = (int)tickList.getRaw(index) & 0xFFFF;
+-                final BlockState state = states.get(location);
++            final int location = (int)tickList.getRaw(index) & 0xFFFF;
++            final BlockState state = states.get(location);
+ 
+-                // do not use a mutable pos, as some random tick implementations store the input without calling immutable()!
+-                final BlockPos pos = new BlockPos((location & 15) | offsetX, ((location >>> (4 + 4)) & 15) | offsetY, ((location >>> 4) & 15) | offsetZ);
++            // do not use a mutable pos, as some random tick implementations store the input without calling immutable()!
++            final BlockPos pos = new BlockPos((location & 15) | offsetX, ((location >>> (4 + 4)) & 15) | offsetY, ((location >>> 4) & 15) | offsetZ);
+ 
+-                state.randomTick((ServerLevel)(Object)this, pos, simpleRandom);
+-                if (doubleTickFluids) {
+-                    final FluidState fluidState = state.getFluidState();
+-                    if (fluidState.isRandomlyTicking()) {
+-                        fluidState.randomTick((ServerLevel)(Object)this, pos, simpleRandom);
+-                    }
++            state.randomTick((ServerLevel)(Object)this, pos, simpleRandom);
++            if (doubleTickFluids) {
++                final FluidState fluidState = state.getFluidState();
++                if (fluidState.isRandomlyTicking()) {
++                    fluidState.randomTick((ServerLevel)(Object)this, pos, simpleRandom);
+                 }
+             }
+         }
+-
+-        return;
+     }
++    // Paper end - skip empty random-tick sections
+     // Paper end - optimise random ticking
+ 
+     public void tickChunk(final LevelChunk chunk, final int tickSpeed) {
+diff --git a/net/minecraft/world/level/chunk/LevelChunk.java b/net/minecraft/world/level/chunk/LevelChunk.java
+index 681563230061212afa7994c8eb16c068754db5dd..1bde1a78ec8b25cec558c07baad6e6572b937cbd 100644
+--- a/net/minecraft/world/level/chunk/LevelChunk.java
++++ b/net/minecraft/world/level/chunk/LevelChunk.java
+@@ -121,6 +121,61 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+         this.chunkAndHolder = holder;
+     }
+     // Paper end - rewrite chunk system
++    // Paper start - skip empty random-tick sections
++    private long[] randomTickSectionMask;
++    private int randomTickEligibleCount;
++
++    public final void noteRandomTickSection(final int index, final boolean ticking) {
++        final long[] mask = this.randomTickSectionMask;
++        if (mask == null || index < 0) {
++            return;
++        }
++        final int word = index >>> 6;
++        if (word >= mask.length) {
++            return;
++        }
++        final long bit = 1L << (index & 63);
++        final boolean was = (mask[word] & bit) != 0L;
++        if (was == ticking) {
++            return;
++        }
++        if (ticking) {
++            mask[word] |= bit;
++            this.randomTickEligibleCount++;
++        } else {
++            mask[word] &= ~bit;
++            this.randomTickEligibleCount--;
++        }
++    }
++
++    public final void bindRandomTickSections() {
++        final LevelChunkSection[] sections = this.getSections();
++        final int words = (sections.length + 63) >> 6;
++        if (this.randomTickSectionMask == null || this.randomTickSectionMask.length != words) {
++            this.randomTickSectionMask = new long[Math.max(words, 1)];
++        } else {
++            java.util.Arrays.fill(this.randomTickSectionMask, 0L);
++        }
++        this.randomTickEligibleCount = 0;
++        for (int i = 0; i < sections.length; i++) {
++            final LevelChunkSection section = sections[i];
++            if (section != null) {
++                section.bindRandomTickChunk(this, i);
++                if (section.isRandomlyTickingBlocks()) {
++                    this.noteRandomTickSection(i, true);
++                }
++            }
++        }
++    }
++
++    public final int randomTickEligibleCount() {
++        return this.randomTickEligibleCount;
++    }
++
++    public final long[] randomTickSectionMask() {
++        return this.randomTickSectionMask;
++    }
++    // Paper end - skip empty random-tick sections
+     // Paper start - get block chunk optimisation
+     private static final BlockState AIR_BLOCKSTATE = Blocks.AIR.defaultBlockState();
+     private static final FluidState AIR_FLUIDSTATE = Fluids.EMPTY.defaultFluidState();
+@@ -172,6 +227,9 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+         this.debug = !empty && this.level.isDebug();
+         this.defaultBlockState = empty ? VOID_AIR_BLOCKSTATE : AIR_BLOCKSTATE;
+         // Paper end - get block chunk optimisation
++        if (!empty) {
++            this.bindRandomTickSections(); // Paper - skip empty random-tick sections
++        }
+     }
+ 
+     public LevelChunk(final ServerLevel level, final ProtoChunk protoChunk, final LevelChunk.@Nullable PostLoadProcessor postLoad) {
+diff --git a/net/minecraft/world/level/chunk/LevelChunkSection.java b/net/minecraft/world/level/chunk/LevelChunkSection.java
+index 705f6314d2550b0f1c8c5209dd65161d89cbfd7e..d3cf7cdfb7e2f6ef918a80a7b57c6c329f42e049 100644
+--- a/net/minecraft/world/level/chunk/LevelChunkSection.java
++++ b/net/minecraft/world/level/chunk/LevelChunkSection.java
+@@ -41,6 +41,22 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+         return this.tickingBlocks;
+     }
+     // Paper end - block counting
++    // Paper start - skip empty random-tick sections
++    private LevelChunk randomTickChunk;
++    private int randomTickIndex = -1;
++
++    public final void bindRandomTickChunk(final LevelChunk chunk, final int index) {
++        this.randomTickChunk = chunk;
++        this.randomTickIndex = index;
++    }
++
++    private void notifyRandomTickIndex(final boolean wasTicking) {
++        final boolean nowTicking = this.tickingBlockCount > 0;
++        if (wasTicking != nowTicking && this.randomTickChunk != null) {
++            this.randomTickChunk.noteRandomTickSection(this.randomTickIndex, nowTicking);
++        }
++    }
++    // Paper end - skip empty random-tick sections
+ 
+     private LevelChunkSection(final LevelChunkSection source) {
+         this.nonEmptyBlockCount = source.nonEmptyBlockCount;
+@@ -135,6 +151,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+             previous = this.states.getAndSetUnchecked(sectionX, sectionY, sectionZ, state);
+         }
+ 
++        final boolean wasTicking = this.tickingBlockCount > 0; // Paper - skip empty random-tick sections
+         if (!previous.isAir()) {
+             this.nonEmptyBlockCount--;
+             if (previous.isRandomlyTicking()) {
+@@ -166,6 +183,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+         }
+ 
+         this.updateBlockCallback(sectionX, sectionY, sectionZ, state, previous); // Paper - block counting
++        this.notifyRandomTickIndex(wasTicking); // Paper - skip empty random-tick sections
+ 
+         return previous;
+     }
+@@ -193,6 +211,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+     public void recalcBlockCounts() {
+         // Paper start - block counting
+         // reset, then recalculate
++        final boolean wasTicking = this.tickingBlockCount > 0; // Paper - skip empty random-tick sections
+         this.nonEmptyBlockCount = (short)0;
+         this.fluidCount = (short)0;
+         this.tickingBlockCount = (short)0;
+@@ -256,6 +275,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+             }
+         }
+         // Paper end - block counting
++        this.notifyRandomTickIndex(wasTicking); // Paper - skip empty random-tick sections
+     }
+ 
+     public PalettedContainer<BlockState> getStates() {
