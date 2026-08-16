@@ -25,7 +25,7 @@ The project addresses traditional bottlenecking in server execution by combining
 Selected serial optimizations engineered for ConfluenceMC are extracted and contributed upstream to projects such as Paper and Moonrise prior to full engine releases.
 
 * **Sparse Section Bitmasking (SSTI)**  
-  An active-section index for Moonrise's random-tick phase that eliminates empty-section iteration in O(1) time while strictly maintaining RNG sequence parity and section execution order.
+  Per-chunk bitset of sections with randomly ticking blocks. Sparse chunks skip empty sections; dense chunks keep the linear scan. Same RNG and section order. The mask is rebuilt on chunk load and when section objects are replaced.
 
 ---
 

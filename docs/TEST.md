@@ -5,7 +5,7 @@ Same algorithm as the Moonrise / Paper change: skip empty sections in the outer 
 ## Scope
 
 * **Primary:** In-game time spent in `optimiseRandomTick` only.
-* **Correctness:** Compact walk vs. current Moonrise linear walk (48 test cases).
+* **Correctness:** Compact walk vs. current Moonrise linear walk (62 test cases).
 * **Supporting:** Walk-only microbench with inner tick execution stubbed.
 * **Smoke Test:** Verified functional crop growth (wheat) under patched build.
 * **Out of Scope:** Full tick MSPT, Folia multi-threading, ice/snow melting, and scheduled fluid/block ticks.
@@ -85,14 +85,14 @@ Timers measured `System.nanoTime` directly around `optimiseRandomTick`, summed p
 
 ## 2. Equivalence Harness
 
-Compares compact vs. linear fingerprints (section order, RNG call count, packed hit indices). Covers empty/sparse/dense chunks, custom height limits, 0 to non-zero transitions, recalculations, load bindings, same-tick cursor movement, and bulk edits.
+Compares compact vs. linear fingerprints (section order, RNG call count, packed hit indices). Covers empty/sparse/dense chunks, custom height limits, 0 to non-zero transitions, recalculations, load bindings, same-tick cursor movement, bulk edits, and direct section-object replacement (rebind on identity change).
 
 ```bash
 javac --release 25 CompactRandomTickTest.java RandomTickSimulator.java RandomTickSectionMask.java FakeSection.java
 java paper.rtcompact.CompactRandomTickTest
 ```
 
-**Result:** 48 cases, 0 failed.
+**Result:** 62 cases, 0 failed.
 
 > Empty sections were never part of the random-tick RNG stream. Skipping them cannot cause RNG drift for `SimpleThreadUnsafeRandom`. Same-tick behavior matches Moonrise: the walk is a live forward scan (`from = index + 1`), not a static snapshot.
 
@@ -117,5 +117,5 @@ Tests algorithm overhead only (section walk & bitset maintenance with inner tick
 ## Known Limits & Architectural Invariants
 
 1. **Dense Chunks (`eligible * 2 >= section count`):** Falls back to original linear scan to avoid bitmask traversal overhead.
-2. **Direct Section Swaps:** Replacing a `LevelChunkSection` object directly inside `getSections()` without rebinding the mask is unsupported.
-3. **Bypassing API:** Writes that bypass `setBlockState` or `recalcBlockCounts` already break Moonrise block counts; this patch maintains those existing invariants.
+2. **Direct Section Swaps:** `getSections()[i] = newSection` (WorldEdit/FAWE) is rebound at the start of `optimiseRandomTick` by comparing section object identity, then rebuilding the mask from `tickingBlockCount > 0`. Detached section objects are unbound so they cannot write the old index.
+3. **Bypassing API:** Writes that bypass `setBlockState` or `recalcBlockCounts` already break Moonrise block counts; this change does not claim more than that.
