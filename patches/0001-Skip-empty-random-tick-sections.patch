@@ -7,6 +7,7 @@ Moonrise already skips the inner random-tick loop when a section has
 no ticking blocks, but the outer loop still visits every section.
 Keep a per-chunk bitset of sections with tickingBlockCount > 0, updated
 from LevelChunkSection on 0/non-zero transitions (including recalc).
+Rebuild the mask when section objects in getSections() are replaced.
 Sparse chunks iterate set bits in sectionIndex order; dense chunks keep
 the linear scan. Empty sections never consumed random-tick RNG.
 
@@ -14,7 +15,7 @@ diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/
 index 59598bfb95c2f8a38efd92685c46a954dc76739d..69279f4cefa8d09484410209fb71eee0abe49deb 100644
 --- a/net/minecraft/server/level/ServerLevel.java
 +++ b/net/minecraft/server/level/ServerLevel.java
-@@ -972,44 +972,85 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+@@ -972,44 +972,83 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
          final ChunkPos cpos = chunk.getPos();
          final int offsetX = cpos.x() << 4;
          final int offsetZ = cpos.z() << 4;
@@ -29,9 +30,7 @@ index 59598bfb95c2f8a38efd92685c46a954dc76739d..69279f4cefa8d09484410209fb71eee0
 +        // Paper start - skip empty random-tick sections
 +        // Empty sections never consume random-tick RNG (the inner loop is behind tickingBlockCount > 0).
 +        // Walk only those sections when sparse; dense chunks keep the original linear scan.
-+        if (chunk.randomTickSectionMask() == null) {
-+            chunk.bindRandomTickSections();
-+        }
++        chunk.ensureRandomTickSections();
 +        final int eligible = chunk.randomTickEligibleCount();
 +        if (eligible <= 0) {
 +            return;
@@ -130,13 +129,14 @@ diff --git a/net/minecraft/world/level/chunk/LevelChunk.java b/net/minecraft/wor
 index 681563230061212afa7994c8eb16c068754db5dd..1bde1a78ec8b25cec558c07baad6e6572b937cbd 100644
 --- a/net/minecraft/world/level/chunk/LevelChunk.java
 +++ b/net/minecraft/world/level/chunk/LevelChunk.java
-@@ -121,6 +121,61 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+@@ -121,6 +121,92 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
          this.chunkAndHolder = holder;
      }
      // Paper end - rewrite chunk system
 +    // Paper start - skip empty random-tick sections
 +    private long[] randomTickSectionMask;
 +    private int randomTickEligibleCount;
++    private LevelChunkSection[] boundSectionRefs;
 +
 +    public final void noteRandomTickSection(final int index, final boolean ticking) {
 +        final long[] mask = this.randomTickSectionMask;
@@ -163,6 +163,15 @@ index 681563230061212afa7994c8eb16c068754db5dd..1bde1a78ec8b25cec558c07baad6e657
 +
 +    public final void bindRandomTickSections() {
 +        final LevelChunkSection[] sections = this.getSections();
++        final LevelChunkSection[] oldRefs = this.boundSectionRefs;
++        if (oldRefs != null) {
++            for (int i = 0; i < oldRefs.length; i++) {
++                final LevelChunkSection old = oldRefs[i];
++                if (old != null && (i >= sections.length || old != sections[i])) {
++                    old.unbindRandomTickChunk();
++                }
++            }
++        }
 +        final int words = (sections.length + 63) >> 6;
 +        if (this.randomTickSectionMask == null || this.randomTickSectionMask.length != words) {
 +            this.randomTickSectionMask = new long[Math.max(words, 1)];
@@ -179,6 +188,27 @@ index 681563230061212afa7994c8eb16c068754db5dd..1bde1a78ec8b25cec558c07baad6e657
 +                }
 +            }
 +        }
++        this.boundSectionRefs = java.util.Arrays.copyOf(sections, sections.length);
++    }
++
++    public final void ensureRandomTickSections() {
++        final LevelChunkSection[] sections = this.getSections();
++        if (this.randomTickSectionMask == null || this.sectionRefsChanged(sections)) {
++            this.bindRandomTickSections();
++        }
++    }
++
++    private boolean sectionRefsChanged(final LevelChunkSection[] sections) {
++        final LevelChunkSection[] bound = this.boundSectionRefs;
++        if (bound == null || bound.length != sections.length) {
++            return true;
++        }
++        for (int i = 0; i < sections.length; i++) {
++            if (bound[i] != sections[i]) {
++                return true;
++            }
++        }
++        return false;
 +    }
 +
 +    public final int randomTickEligibleCount() {
@@ -192,7 +222,7 @@ index 681563230061212afa7994c8eb16c068754db5dd..1bde1a78ec8b25cec558c07baad6e657
      // Paper start - get block chunk optimisation
      private static final BlockState AIR_BLOCKSTATE = Blocks.AIR.defaultBlockState();
      private static final FluidState AIR_FLUIDSTATE = Fluids.EMPTY.defaultFluidState();
-@@ -172,6 +227,9 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+@@ -172,6 +258,9 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
          this.debug = !empty && this.level.isDebug();
          this.defaultBlockState = empty ? VOID_AIR_BLOCKSTATE : AIR_BLOCKSTATE;
          // Paper end - get block chunk optimisation
@@ -202,11 +232,21 @@ index 681563230061212afa7994c8eb16c068754db5dd..1bde1a78ec8b25cec558c07baad6e657
      }
  
      public LevelChunk(final ServerLevel level, final ProtoChunk protoChunk, final LevelChunk.@Nullable PostLoadProcessor postLoad) {
+@@ -625,6 +714,9 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+             this.postLoad.run(this);
+             this.postLoad = null;
+         }
++        if (!((Object)this instanceof EmptyLevelChunk)) {
++            this.bindRandomTickSections(); // Paper - skip empty random-tick sections
++        }
+     }
+ 
+     // CraftBukkit start
 diff --git a/net/minecraft/world/level/chunk/LevelChunkSection.java b/net/minecraft/world/level/chunk/LevelChunkSection.java
 index 705f6314d2550b0f1c8c5209dd65161d89cbfd7e..d3cf7cdfb7e2f6ef918a80a7b57c6c329f42e049 100644
 --- a/net/minecraft/world/level/chunk/LevelChunkSection.java
 +++ b/net/minecraft/world/level/chunk/LevelChunkSection.java
-@@ -41,6 +41,22 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+@@ -41,6 +41,27 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
          return this.tickingBlocks;
      }
      // Paper end - block counting
@@ -219,6 +259,11 @@ index 705f6314d2550b0f1c8c5209dd65161d89cbfd7e..d3cf7cdfb7e2f6ef918a80a7b57c6c32
 +        this.randomTickIndex = index;
 +    }
 +
++    public final void unbindRandomTickChunk() {
++        this.randomTickChunk = null;
++        this.randomTickIndex = -1;
++    }
++
 +    private void notifyRandomTickIndex(final boolean wasTicking) {
 +        final boolean nowTicking = this.tickingBlockCount > 0;
 +        if (wasTicking != nowTicking && this.randomTickChunk != null) {
@@ -229,7 +274,7 @@ index 705f6314d2550b0f1c8c5209dd65161d89cbfd7e..d3cf7cdfb7e2f6ef918a80a7b57c6c32
  
      private LevelChunkSection(final LevelChunkSection source) {
          this.nonEmptyBlockCount = source.nonEmptyBlockCount;
-@@ -135,6 +151,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+@@ -135,6 +156,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
              previous = this.states.getAndSetUnchecked(sectionX, sectionY, sectionZ, state);
          }
  
@@ -237,7 +282,7 @@ index 705f6314d2550b0f1c8c5209dd65161d89cbfd7e..d3cf7cdfb7e2f6ef918a80a7b57c6c32
          if (!previous.isAir()) {
              this.nonEmptyBlockCount--;
              if (previous.isRandomlyTicking()) {
-@@ -166,6 +183,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+@@ -166,6 +188,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
          }
  
          this.updateBlockCallback(sectionX, sectionY, sectionZ, state, previous); // Paper - block counting
@@ -245,7 +290,7 @@ index 705f6314d2550b0f1c8c5209dd65161d89cbfd7e..d3cf7cdfb7e2f6ef918a80a7b57c6c32
  
          return previous;
      }
-@@ -193,6 +211,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+@@ -193,6 +216,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
      public void recalcBlockCounts() {
          // Paper start - block counting
          // reset, then recalculate
@@ -253,7 +298,7 @@ index 705f6314d2550b0f1c8c5209dd65161d89cbfd7e..d3cf7cdfb7e2f6ef918a80a7b57c6c32
          this.nonEmptyBlockCount = (short)0;
          this.fluidCount = (short)0;
          this.tickingBlockCount = (short)0;
-@@ -256,6 +275,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
+@@ -256,6 +280,7 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
              }
          }
          // Paper end - block counting
