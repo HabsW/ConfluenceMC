@@ -25,7 +25,7 @@ The project addresses traditional bottlenecking in server execution by combining
 Selected serial optimizations engineered for ConfluenceMC are extracted and contributed upstream to projects such as Paper and Moonrise prior to full engine releases.
 
 * **Sparse Section Bitmasking (SSTI)**  
-  Per-chunk bitset of sections with randomly ticking blocks. Sparse chunks skip empty sections; dense chunks keep the linear scan. Same RNG and section order. The mask is rebuilt on chunk load and when section objects are replaced.
+  Skip empty sections in Moonrise's outer random-tick loop. Dense chunks keep the linear scan. Same RNG and section order. The mask is built on load, updated when a section crosses 0/non-zero ticking blocks, and rebuilt if a plugin replaces a section object through `getSections()` (WorldEdit/FAWE). Isolated `optimiseRandomTick` time, not whole-server MSPT: normal overworld unchanged; skyblock 231 to 121 µs; End 234 to 115 µs. See [docs/TEST.md](docs/TEST.md).
 
 ---
 

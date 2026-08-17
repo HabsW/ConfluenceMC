@@ -1,21 +1,35 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: HabsW <d@v1d.eu>
-Date: Fri, 14 Aug 2026 13:06:03 +0200
+Date: Mon, 17 Aug 2026 03:45:00 +0200
 Subject: [PATCH] Skip empty random-tick sections
 
 Moonrise already skips the inner random-tick loop when a section has
 no ticking blocks, but the outer loop still visits every section.
 Keep a per-chunk bitset of sections with tickingBlockCount > 0, updated
 from LevelChunkSection on 0/non-zero transitions (including recalc).
-Rebuild the mask when section objects in getSections() are replaced.
-Sparse chunks iterate set bits in sectionIndex order; dense chunks keep
-the linear scan. Empty sections never consumed random-tick RNG.
+Rebuild the mask after load and when getSections() is used to replace
+section objects (WorldEdit/FAWE). Sparse chunks iterate set bits in
+sectionIndex order; dense chunks keep the linear scan. Empty sections
+never consumed random-tick RNG.
 
 diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
-index 59598bfb95c2f8a38efd92685c46a954dc76739d..69279f4cefa8d09484410209fb71eee0abe49deb 100644
+index 59598bf..fd1d9a8 100644
 --- a/net/minecraft/server/level/ServerLevel.java
 +++ b/net/minecraft/server/level/ServerLevel.java
-@@ -972,44 +972,83 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+@@ -964,7 +964,12 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+     private final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom simpleRandom = new ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom(net.minecraft.world.level.levelgen.RandomSupport.generateUniqueSeed());
+ 
+     private void optimiseRandomTick(final LevelChunk chunk, final int tickSpeed) {
++        chunk.beginRandomTickGetSections();
+         final LevelChunkSection[] sections = chunk.getSections();
++        chunk.endRandomTickGetSections();
++        if (chunk.randomTickSectionMask() == null || chunk.consumeSectionArrayBorrowed()) {
++            chunk.ensureRandomTickSections();
++        }
+         final int minSection = ca.spottedleaf.moonrise.common.util.WorldUtil.getMinSection((ServerLevel)(Object)this);
+         final ca.spottedleaf.moonrise.common.util.SimpleThreadUnsafeRandom simpleRandom = this.simpleRandom;
+         final boolean doubleTickFluids = !ca.spottedleaf.moonrise.common.PlatformHooks.get().configFixMC224294();
+@@ -972,44 +977,82 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
          final ChunkPos cpos = chunk.getPos();
          final int offsetX = cpos.x() << 4;
          final int offsetZ = cpos.z() << 4;
@@ -30,7 +44,6 @@ index 59598bfb95c2f8a38efd92685c46a954dc76739d..69279f4cefa8d09484410209fb71eee0
 +        // Paper start - skip empty random-tick sections
 +        // Empty sections never consume random-tick RNG (the inner loop is behind tickingBlockCount > 0).
 +        // Walk only those sections when sparse; dense chunks keep the original linear scan.
-+        chunk.ensureRandomTickSections();
 +        final int eligible = chunk.randomTickEligibleCount();
 +        if (eligible <= 0) {
 +            return;
@@ -126,10 +139,10 @@ index 59598bfb95c2f8a38efd92685c46a954dc76739d..69279f4cefa8d09484410209fb71eee0
  
      public void tickChunk(final LevelChunk chunk, final int tickSpeed) {
 diff --git a/net/minecraft/world/level/chunk/LevelChunk.java b/net/minecraft/world/level/chunk/LevelChunk.java
-index 681563230061212afa7994c8eb16c068754db5dd..1bde1a78ec8b25cec558c07baad6e6572b937cbd 100644
+index 6815632..93cfd84 100644
 --- a/net/minecraft/world/level/chunk/LevelChunk.java
 +++ b/net/minecraft/world/level/chunk/LevelChunk.java
-@@ -121,6 +121,92 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+@@ -121,6 +121,120 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
          this.chunkAndHolder = holder;
      }
      // Paper end - rewrite chunk system
@@ -137,6 +150,8 @@ index 681563230061212afa7994c8eb16c068754db5dd..1bde1a78ec8b25cec558c07baad6e657
 +    private long[] randomTickSectionMask;
 +    private int randomTickEligibleCount;
 +    private LevelChunkSection[] boundSectionRefs;
++    private int randomTickGetSectionsSuppress;
++    private boolean sectionArrayBorrowed;
 +
 +    public final void noteRandomTickSection(final int index, final boolean ticking) {
 +        final long[] mask = this.randomTickSectionMask;
@@ -162,7 +177,7 @@ index 681563230061212afa7994c8eb16c068754db5dd..1bde1a78ec8b25cec558c07baad6e657
 +    }
 +
 +    public final void bindRandomTickSections() {
-+        final LevelChunkSection[] sections = this.getSections();
++        final LevelChunkSection[] sections = this.sections;
 +        final LevelChunkSection[] oldRefs = this.boundSectionRefs;
 +        if (oldRefs != null) {
 +            for (int i = 0; i < oldRefs.length; i++) {
@@ -192,10 +207,36 @@ index 681563230061212afa7994c8eb16c068754db5dd..1bde1a78ec8b25cec558c07baad6e657
 +    }
 +
 +    public final void ensureRandomTickSections() {
-+        final LevelChunkSection[] sections = this.getSections();
++        final LevelChunkSection[] sections = this.sections;
 +        if (this.randomTickSectionMask == null || this.sectionRefsChanged(sections)) {
 +            this.bindRandomTickSections();
 +        }
++    }
++
++    public final void beginRandomTickGetSections() {
++        this.randomTickGetSectionsSuppress++;
++    }
++
++    public final void endRandomTickGetSections() {
++        this.randomTickGetSectionsSuppress--;
++    }
++
++    public final boolean consumeSectionArrayBorrowed() {
++        if (!this.sectionArrayBorrowed) {
++            return false;
++        }
++        this.sectionArrayBorrowed = false;
++        return true;
++    }
++
++    @Override
++    public LevelChunkSection[] getSections() {
++        // FAWE/WorldEdit replace sections via getSections()[i] = newSection.
++        // Mark dirty so the next random tick rebinds; do not scan every chunk every tick.
++        if (this.randomTickGetSectionsSuppress == 0) {
++            this.sectionArrayBorrowed = true;
++        }
++        return this.sections;
 +    }
 +
 +    private boolean sectionRefsChanged(final LevelChunkSection[] sections) {
@@ -222,7 +263,7 @@ index 681563230061212afa7994c8eb16c068754db5dd..1bde1a78ec8b25cec558c07baad6e657
      // Paper start - get block chunk optimisation
      private static final BlockState AIR_BLOCKSTATE = Blocks.AIR.defaultBlockState();
      private static final FluidState AIR_FLUIDSTATE = Fluids.EMPTY.defaultFluidState();
-@@ -172,6 +258,9 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+@@ -172,6 +286,9 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
          this.debug = !empty && this.level.isDebug();
          this.defaultBlockState = empty ? VOID_AIR_BLOCKSTATE : AIR_BLOCKSTATE;
          // Paper end - get block chunk optimisation
@@ -232,7 +273,7 @@ index 681563230061212afa7994c8eb16c068754db5dd..1bde1a78ec8b25cec558c07baad6e657
      }
  
      public LevelChunk(final ServerLevel level, final ProtoChunk protoChunk, final LevelChunk.@Nullable PostLoadProcessor postLoad) {
-@@ -625,6 +714,9 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
+@@ -625,6 +742,9 @@ public class LevelChunk extends ChunkAccess implements DebugValueSource, ca.spot
              this.postLoad.run(this);
              this.postLoad = null;
          }
@@ -243,7 +284,7 @@ index 681563230061212afa7994c8eb16c068754db5dd..1bde1a78ec8b25cec558c07baad6e657
  
      // CraftBukkit start
 diff --git a/net/minecraft/world/level/chunk/LevelChunkSection.java b/net/minecraft/world/level/chunk/LevelChunkSection.java
-index 705f6314d2550b0f1c8c5209dd65161d89cbfd7e..d3cf7cdfb7e2f6ef918a80a7b57c6c329f42e049 100644
+index 705f631..7ece8c4 100644
 --- a/net/minecraft/world/level/chunk/LevelChunkSection.java
 +++ b/net/minecraft/world/level/chunk/LevelChunkSection.java
 @@ -41,6 +41,27 @@ public class LevelChunkSection implements ca.spottedleaf.moonrise.patches.block_
@@ -306,3 +347,16 @@ index 705f6314d2550b0f1c8c5209dd65161d89cbfd7e..d3cf7cdfb7e2f6ef918a80a7b57c6c32
      }
  
      public PalettedContainer<BlockState> getStates() {
+diff --git a/net/minecraft/world/level/chunk/ChunkAccess.java b/net/minecraft/world/level/chunk/ChunkAccess.java
+index 28f7032..8a5670a 100644
+--- a/net/minecraft/world/level/chunk/ChunkAccess.java
++++ b/net/minecraft/world/level/chunk/ChunkAccess.java
+@@ -228,7 +228,7 @@ public abstract class ChunkAccess implements LightChunk, StructureAccess, BiomeM
+     }
+ 
+     public LevelChunkSection getSection(final int sectionIndex) {
+-        return this.getSections()[sectionIndex];
++        return this.sections[sectionIndex];
+     }
+ 
+     public Collection<Entry<Heightmap.Types, Heightmap>> getHeightmaps() {
